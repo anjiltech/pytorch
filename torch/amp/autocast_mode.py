@@ -355,9 +355,24 @@ class autocast:
         torch.autocast_increment_nesting()
         torch.set_autocast_cache_enabled(self._cache_enabled)
 
+        if torch._C._is_torch_function_mode_enabled():
+            return torch.overrides.handle_torch_function(
+                torch.amp._enter_autocast,
+                [],
+                self.device,
+                self.fast_dtype,
+                self._enabled,
+                self._cache_enabled,
+            )
+
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any):  # type: ignore[override]
         if torch._jit_internal.is_scripting():
             return
+
+        if torch._C._is_torch_function_mode_enabled():
+            return torch.overrides.handle_torch_function(
+                torch.amp._exit_autocast, [], self
+            )
 
         # Drop the cache when we exit to a nesting level that's outside any instance of autocast.
         if torch.autocast_decrement_nesting() == 0:
