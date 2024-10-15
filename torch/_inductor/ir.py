@@ -2922,9 +2922,17 @@ class Layout(IRNode):
         ), f"size={size}, stride={stride}"
         self.device = device
         self.dtype = dtype
-        assert all(isinstance(s, (Expr, int)) for s in size)
-        self.size = size
-        self._stride = stride
+
+        def _symint_to_sympy_expr(s: Union[Expr, int, torch.SymInt]):
+            if isinstance(s, torch.SymInt):
+                return s.node.expr
+            return s
+
+        assert all(isinstance(s, (torch.SymInt, Expr, int)) for s in size)
+        self.size = [_symint_to_sympy_expr(s) for s in size]
+        self._stride = (
+            [_symint_to_sympy_expr(s) for s in stride] if stride is not None else stride
+        )
         self.offset = offset
 
     @property
@@ -4159,6 +4167,9 @@ class InputsKernel(OperationBuffer):
         for input in self.inputs:
             if isinstance(input, list):
                 reads.update(StarDep(x.get_name()) for x in input)
+            elif isinstance(input, ShapeAsConstantBuffer):
+                # Skip creating dependncy for symbolics as they're visible globally
+                continue
             else:
                 reads.add(StarDep(input.get_name()))
 
@@ -4733,6 +4744,8 @@ class ExternKernel(InputsKernel):
             return NoneAsConstantBuffer()
         if isinstance(x, (sympy.Expr, sympy.logic.boolalg.Boolean, int)):
             return ShapeAsConstantBuffer(x)
+        if isinstance(x, torch.SymInt):
+            return ShapeAsConstantBuffer(x.node.expr)
         if isinstance(x, Constant):
             return V.graph.add_tensor_constant(
                 torch.tensor(x.value, dtype=x.get_dtype(), device=x.get_device())
@@ -6656,6 +6669,8 @@ class WhileLoop(ExternKernel):
     cond_subgraph: Optional[Subgraph] = None
     body_subgraph: Optional[Subgraph] = None
     outputs: Optional[List[MultiOutput]] = None
+    mutated_inputs: Optional[List[TensorBox]] = None
+    iter_idx_expr: Optional[sympy.Expr] = None
 
     def __init__(
         self,
@@ -6664,11 +6679,15 @@ class WhileLoop(ExternKernel):
         cond_subgraph: Subgraph,
         body_subgraph: Subgraph,
         layout: MultiOutputLayout,
+        mutated_inputs: List[TensorBox],
+        iter_idx_expr: sympy.Symbol,
     ):
         self.carried_inputs = carried_inputs
         self.additional_inputs = additional_inputs
         self.cond_subgraph = cond_subgraph
         self.body_subgraph = body_subgraph
+        self.iter_idx_expr = iter_idx_expr
+        self.mutated_inputs = mutated_inputs
 
         super().__init__(
             name=None,
@@ -6684,27 +6703,16 @@ class WhileLoop(ExternKernel):
         cls,
         cond_fn: Subgraph,
         body_fn: Subgraph,
-        carried_inputs: List[TensorBox],
-        additional_inputs: List[TensorBox],
+        carried_inputs: List[Union[TensorBox, ComputedBuffer]],
+        additional_inputs: List[Union[TensorBox, ComputedBuffer]],
+        iter_idx_expr: Optional[sympy.Symbol] = None,
     ):
         carried_inputs = [cls.realize_input(x) for x in carried_inputs]
         additional_inputs = [cls.realize_input(x) for x in additional_inputs]
         all_inputs = carried_inputs + additional_inputs
+        mutated_inputs = [all_inputs[idx] for idx in body_fn.graph.mutated_input_idxs]
 
-        fx_all_inputs = V.graph.current_node.args[-2] + V.graph.current_node.args[-1]  # type: ignore[operator]
-        fake_all_inputs = [x.meta["val"] for x in fx_all_inputs]  # type: ignore[union-attr]
-
-        for subgraph in (cond_fn, body_fn):
-            if subgraph.graph is None:
-                # create and lower subgraphs
-                subgraph.graph = V.graph.make_subgraph(
-                    gm=subgraph.graph_module,
-                    example_inputs=fx_all_inputs,  # type: ignore[arg-type]
-                    subgraph_name=subgraph.name,
-                )
-                with V.set_graph_handler(subgraph.graph):
-                    subgraph.graph.run(*fake_all_inputs)
-
+        assert cond_fn.graph is not None and body_fn.graph is not None
         cond_outputs = cond_fn.graph.graph_outputs  # type: ignore[union-attr]
         body_outputs = body_fn.graph.graph_outputs  # type: ignore[union-attr]
 
@@ -6716,8 +6724,9 @@ class WhileLoop(ExternKernel):
 
         # make sure cond_fn returns a boolean scalar Tensor
         assert len(cond_outputs) == 1, cond_outputs
-        assert cond_outputs[0].get_dtype() == torch.bool, cond_outputs
-        assert len(cond_outputs[0].get_size()) == 0, cond_outputs
+        if not isinstance(cond_outputs[0], ShapeAsConstantBuffer):
+            assert cond_outputs[0].get_dtype() == torch.bool, cond_outputs
+            assert len(cond_outputs[0].get_size()) == 0, cond_outputs
 
         assert (
             len(all_inputs) > 0
@@ -6727,14 +6736,27 @@ class WhileLoop(ExternKernel):
 
         # make sure carried_inputs and body outputs are structurally equivalent
         assert len(carried_inputs) == len(body_outputs), (carried_inputs, body_outputs)
+
+        def _guard_list_equals(
+            li: List[Union[int, sympy.Expr]], ri: List[Union[int, sympy.Expr]]
+        ):
+            for l, r in zip(li, ri):
+                V.graph.sizevars.guard_equals(l, r)
+
         for i, (op, bo) in enumerate(zip(carried_inputs, body_outputs)):
-            assert op.get_size() == bo.get_size(), (i, op, bo)
-            assert op.get_stride() == bo.get_stride(), (i, op, bo)
+            if isinstance(op, ShapeAsConstantBuffer):
+                assert isinstance(bo, ShapeAsConstantBuffer), (i, op, bo)
+                continue
+            # We already know that correponding carried_inputs and body_outputs
+            # should have same strides and sizes. This is enforced by the front-end
+            # so we guard them to be equal.
+            _guard_list_equals(op.get_size(), bo.get_size())
+            _guard_list_equals(op.get_stride(), bo.get_stride())
             # assume all carried_inputs and outputs are on the same device
             # as the MultiOutputLayout below requires single device
             assert op.get_device() == bo.get_device() == device, (i, op, bo, device)
             assert op.get_dtype() == bo.get_dtype(), (i, op, bo)
-            assert op.get_layout().offset == bo.get_layout().offset, (i, op, bo)
+            assert op.get_layout().offset == op.get_layout().offset, (i, op, bo)
 
         while_loop = WhileLoop(
             carried_inputs=carried_inputs,
@@ -6743,6 +6765,8 @@ class WhileLoop(ExternKernel):
             body_subgraph=body_fn,
             # asserted above that there is at least one operand
             layout=MultiOutputLayout(device=device),
+            mutated_inputs=mutated_inputs,
+            iter_idx_expr=iter_idx_expr,
         )
 
         outputs = [
@@ -6757,11 +6781,17 @@ class WhileLoop(ExternKernel):
                 while_loop,
                 [(list, i)],
             )
+            if not isinstance(output, ShapeAsConstantBuffer)
+            else output
             for i, output in enumerate(body_outputs)
+            if i not in body_fn.graph.mutated_input_idxs
         ]
 
         for inp, out in zip(carried_inputs, outputs):
-            if inp.get_name() in V.graph.graph_inputs:
+            if (
+                not isinstance(inp, ShapeAsConstantBuffer)
+                and inp.get_name() in V.graph.graph_inputs
+            ):
                 # if a carried input of the while_loop is a graph input,
                 # it can be returned as is when the number of iterations
                 # is zero. due to this, we can't (generally) reuse the
@@ -6770,7 +6800,19 @@ class WhileLoop(ExternKernel):
                 V.graph.never_reuse_buffers.add(out.get_name())
 
         while_loop.outputs = outputs
-        return outputs
+        while_loop.mutation_outputs.extend(
+            [
+                MutationOutput(NoneLayout(device), inp, while_loop)
+                for inp in while_loop.mutated_inputs  # type: ignore[union-attr]
+            ]
+        )
+        for out_buffer in mutated_inputs:
+            V.graph.mark_buffer_mutated(out_buffer.get_name())
+
+        for inp in while_loop.carried_inputs:
+            if not isinstance(inp, ShapeAsConstantBuffer):
+                V.graph.never_reuse_buffers.add(inp.get_name())
+        return outputs, mutated_inputs
 
     def codegen(self, wrapper):
         wrapper.codegen_while_loop(self)

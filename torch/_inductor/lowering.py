@@ -6354,8 +6354,74 @@ def while_loop(cond_fn, body_fn, carried_inputs, additional_inputs):
             msg = f"{msg} Found from : \n {stack_trace}"
         V.graph.disable_cudagraphs_reason = msg
 
-    result = ir.WhileLoop.create(cond_fn, body_fn, carried_inputs, additional_inputs)
-    return list(map(TensorBox.create, result))
+    fx_all_inputs = V.graph.current_node.args[-2] + V.graph.current_node.args[-1]  # type: ignore[operator]
+
+    new_carried_inputs = []
+    for fx_init, tb_init in zip(V.graph.current_node.args[-2], carried_inputs):
+        if not isinstance(tb_init, int):
+            new_carried_inputs.append(
+                ir.ExternKernel.require_exact_strides(
+                    tb_init, fx_init.meta["val"].stride(), allow_padding=False
+                )
+            )
+        else:
+            new_carried_inputs.append(tb_init)
+
+    for subgraph in (cond_fn, body_fn):
+        if subgraph.graph is None:
+            # create and lower subgraphs
+            subgraph.graph = V.graph.make_subgraph(
+                gm=subgraph.graph_module,
+                example_inputs=fx_all_inputs,  # type: ignore[arg-type]
+                subgraph_name=subgraph.name,
+            )
+            fake_all_inputs = [
+                node.meta["val"]
+                for node in subgraph.graph_module.graph.nodes
+                if node.op == "placeholder"
+            ]
+            with V.set_graph_handler(subgraph.graph):
+                subgraph.graph.run(*fake_all_inputs)
+                if subgraph is body_fn:
+                    new_subgraph_outputs = []
+                    for fake_carry, carry in zip(
+                        fake_all_inputs, subgraph.graph.graph_outputs
+                    ):
+                        if isinstance(carry, ir.ShapeAsConstantBuffer):
+                            new_subgraph_outputs.append(carry)
+                        else:
+                            new_subgraph_outputs.append(
+                                ir.ExternKernel.require_exact_strides(
+                                    carry, fake_carry.stride(), allow_padding=False
+                                )
+                            )
+                    subgraph.graph.graph_outputs = new_subgraph_outputs
+
+    result, mutated_inputs = ir.WhileLoop.create(
+        cond_fn,
+        body_fn,
+        new_carried_inputs,
+        additional_inputs,
+    )
+
+    def _map_output(x):
+        if isinstance(x, ir.ShapeAsConstantBuffer):
+            return x._shape
+        # test scan_downstream_scan_matmul
+        # where carried_inputs is a StorageBox instead of a computed buffer
+        # maybe we could instead only wrap MultiOutput
+        elif isinstance(x, ir.StorageBox):
+            return TensorBox(x)
+        else:
+            return TensorBox.create(x)
+
+    return list(map(_map_output, result + mutated_inputs))
+
+
+# This is a spcialized version of select because we're certain that the idx is valid
+@register_lowering(torch.ops._scan_helper.unsafe_select, type_promotion_kind=None)
+def _(dst, dim, idx):
+    return squeeze(slice_(dst, dim, idx, idx + 1, step=1, clamp=False), dim)
 
 
 @register_lowering(associative_scan_op, type_promotion_kind=None)

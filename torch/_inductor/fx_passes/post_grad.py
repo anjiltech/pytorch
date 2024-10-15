@@ -170,6 +170,8 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
         lambda: comms.reinplace_fsdp_all_gather(gm.graph), "reinplace_fsdp_all_gather"
     )
 
+    apply_pass(lambda: lower_scan_to_while_loop_pass(gm))
+
     gm.recompile()
     optimus_scuba_log["after_recompile_post_grad"] = upload_graph(gm.graph)
     gm.graph.lint()
@@ -844,7 +846,147 @@ def decompose_auto_functionalized(graph):
         raise AssertionError("triton_kernel_wrapper_functional was not removed")
 
 
-@register_lowering_pattern(
+def lower_scan_to_while_loop_pass(gm: torch.fx.GraphModule):
+    graph_pass = PatternMatcherPass()
+
+    @register_graph_pattern(
+        CallFunctionVarArgs(torch.ops.higher_order.scan),
+        pass_dict=graph_pass,
+    )
+    def _(match: Match, *args, **kwargs):
+        assert (
+            len(kwargs) == 0
+        ), "kwargs of scan are not merged into args before entering lower_scan_to_while_loop_pass"
+        from torch._higher_order_ops.scan import _extract_carry_and_out
+
+        assert (
+            len(kwargs) == 0
+        ), "kwargs are not merged into args before entering inductor."
+        combine_subgraph, fx_init, fx_xs, dim, reverse, fx_additional_inputs = args
+        assert len(match.nodes) == 1
+        cur_node = match.nodes[0]
+        num_init_leaves = len(fx_init)
+        assert combine_subgraph.op == "get_attr", "first arg is not combine_subgraph"
+        sub_gm: torch.fx.GraphModule = getattr(gm, combine_subgraph.target)
+        (
+            fake_init,
+            fake_xs,
+            fake_additional_inputs,
+            specialized_dim,
+            fake_outputs,
+        ) = pytree.tree_map(
+            lambda node: node.meta["val"] if isinstance(node, torch.fx.Node) else node,
+            (fx_init, fx_xs, fx_additional_inputs, dim, cur_node),
+        )
+        fake_xs_subgraph = [t.select(specialized_dim, 0) for t in fake_xs]
+        fake_scan_length = fake_xs[0].size()[specialized_dim]
+        fake_carry_subgraph, fake_ys_outs = _extract_carry_and_out(
+            fake_outputs,
+            num_init_leaves,
+        )
+        fake_mode = fake_init[0].fake_mode
+        fake_args, tree_spec = pytree.tree_flatten(
+            [fake_init, fake_xs, fake_additional_inputs, fake_scan_length]
+        )
+
+        def lower_to_while_loop(*flat_args):
+            (
+                init,
+                xs,
+                additional_inputs,
+                scan_length,
+            ) = pytree.tree_unflatten(flat_args, tree_spec)
+            scan_idx = 0 if not reverse else scan_length - 1
+            sub_xs = []
+            for x in xs:
+                sub_xs.append(
+                    torch.ops._scan_helper.unsafe_select(x, specialized_dim, scan_idx)
+                )
+            next_carry, y_outs = _extract_carry_and_out(
+                sub_gm(*(list(init) + sub_xs + list(additional_inputs))),
+                num_init_leaves,
+            )
+            ys_outs = [y.repeat(scan_length, *([1] * y.ndim)) for y in y_outs]
+
+            while_loop_operands, while_loop_spec = pytree.tree_flatten(
+                (next_carry, xs, additional_inputs, 1, ys_outs)
+            )
+
+            def cond_fn_out(*flat_args):
+                init, xs, additional_inputs, idx, ys_outs = pytree.tree_unflatten(
+                    flat_args, while_loop_spec
+                )
+                return idx < xs[0].size()[specialized_dim]
+
+            def body_fn_out(*flat_args):
+                init, xs, additional_inputs, idx, ys_outs = pytree.tree_unflatten(
+                    flat_args, while_loop_spec
+                )
+                scan_idx = (
+                    idx if not reverse else xs[0].size()[specialized_dim] - idx - 1
+                )
+                sub_xs = []
+                for x in xs:
+                    sub_xs.append(
+                        torch.ops._scan_helper.unsafe_select(
+                            x, specialized_dim, scan_idx
+                        )
+                    )
+
+                new_carry, ys = _extract_carry_and_out(
+                    sub_gm(*(list(init) + sub_xs + list(additional_inputs))),
+                    num_init_leaves,
+                )
+                for y, y_out in zip(ys, ys_outs):
+                    y_out_slice = torch.ops._scan_helper.unsafe_select(
+                        y_out, 0, scan_idx
+                    )
+                    y_out_slice.copy_(y)
+                return *new_carry, *xs, *additional_inputs, idx + 1, *ys_outs
+
+            last_carry, _, _, _, ys_outs = pytree.tree_unflatten(
+                torch.ops.higher_order.while_loop(
+                    cond_fn_out,
+                    body_fn_out,
+                    tuple(while_loop_operands),
+                    tuple(),
+                ),
+                while_loop_spec,
+            )
+            return list(last_carry) + list(ys_outs)
+
+        if isinstance(fake_scan_length, torch.SymInt):
+            with gm.graph.inserting_before(cur_node):
+                fx_scan_length = gm.graph.call_function(
+                    torch.ops.aten.sym_size.int, (fx_xs[0], specialized_dim)
+                )
+                fx_scan_length.meta["val"] = fake_scan_length
+        else:
+            assert isinstance(fake_scan_length, int)
+            fx_scan_length = fake_scan_length
+        lower_to_while_loop_args, _ = pytree.tree_flatten(
+            (
+                fx_init,
+                fx_xs,
+                fx_additional_inputs,
+                fx_scan_length,
+            )
+        )
+        match.replace_by_example(
+            lower_to_while_loop,
+            lower_to_while_loop_args,
+            run_functional_passes=False,
+        )
+
+    graph_pass.apply(gm)
+
+    for node in gm.graph.find_nodes(
+        op="call_function", target=torch.ops.higher_order.scan
+    ):
+        raise AssertionError("scan is not lowered to while_loop")
+
+
+register_lowering_pattern(
     CallFunction(
         aten.cat,
         ListOf(
@@ -865,6 +1007,8 @@ def decompose_auto_functionalized(graph):
     pass_number=2,
     extra_check=is_valid_splitwithsizes_cat,
 )
+
+
 def splitwithsizes_cat_replace(match, input_):
     return input_
 
