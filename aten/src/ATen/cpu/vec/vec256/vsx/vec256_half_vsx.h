@@ -6,6 +6,8 @@
 #include <c10/util/Half.h>
 #include <c10/util/irange.h>
 
+#if defined(__POWER9_VECTOR__)
+
 namespace at {
 namespace vec {
 // See Note [CPU_CAPABILITY namespace]
@@ -350,7 +352,7 @@ class Vectorized<c10::Half> {
     __at_align__ c10::Half tmp[size()];
     store(tmp);
     for (const auto i : c10::irange(size())) {
-      if (_isnan(tmp[i]) || _isinf(tmp[i])) {
+      if (c10::isnan(tmp[i]) || c10::isinf(tmp[i])) {
         return true;
       }
     }
@@ -358,16 +360,18 @@ class Vectorized<c10::Half> {
   }
 
   Vectorized<c10::Half> angle() const {
-    auto zero = Vectorized<c10::Half>(c10::Half(0));
-    auto pi = Vectorized<c10::Half>(c10::Half(c10::pi<float>));
-    auto tmp = blendv(zero, pi, *this < zero);
+    auto tmp = blendv(
+        Vectorized<c10::Half>(c10::Half(0)),
+        Vectorized<c10::Half>(c10::Half(c10::pi<float>)),
+        Vectorized<c10::Half>(c10::Half(c10::pi<float>)).copysign(*this) <
+            Vectorized<c10::Half>(c10::Half(0)));
     return blendv(tmp, *this, isnan());
   }
   Vectorized<c10::Half> real() const { return *this; }
   Vectorized<c10::Half> imag() const { return Vectorized<c10::Half>(c10::Half(0)); }
   Vectorized<c10::Half> conj() const { return *this; }
 
-  // abs/neg operate directly on fp16 bit patterns — no fp32 conversion needed.
+  // abs/neg/copysign operate directly on fp16 bit patterns — no fp32 conversion needed.
   Vectorized<c10::Half> C10_ALWAYS_INLINE abs() const {
     // Clear the sign bit (bit 15) of each fp16 lane.
     const vint16 sign_mask = vec_splats((int16_t)0x8000);
@@ -378,6 +382,14 @@ class Vectorized<c10::Half> {
     // Flip the sign bit (bit 15) of each fp16 lane.
     const vint16 sign_mask = vec_splats((int16_t)0x8000);
     return {vec_xor(_vec0, sign_mask), vec_xor(_vec1, sign_mask)};
+  }
+
+  Vectorized<c10::Half> C10_ALWAYS_INLINE
+  copysign(const Vectorized<c10::Half>& sign) const {
+    const vint16 sign_mask = vec_splats((int16_t)0x8000);
+    return {
+        vec_or(vec_andc(_vec0, sign_mask), vec_and(sign._vec0, sign_mask)),
+        vec_or(vec_andc(_vec1, sign_mask), vec_and(sign._vec1, sign_mask))};
   }
 
   // Non-sleef float ops: widen to fp32 with hardware instructions, apply VSX
@@ -459,7 +471,6 @@ class Vectorized<c10::Half> {
   VSX_HALF_UNARY(atan)
   VSX_HALF_UNARY(atanh)
   VSX_HALF_BINARY(atan2, b)
-  VSX_HALF_BINARY(copysign, sign)
   VSX_HALF_UNARY(erf)
   VSX_HALF_UNARY(erfc)
   VSX_HALF_UNARY(erfinv)
@@ -549,6 +560,30 @@ class Vectorized<c10::Half> {
   operator^(const Vectorized<c10::Half>& other) const {
     return {vec_xor(_vec0, other._vec0), vec_xor(_vec1, other._vec1)};
   }
+
+  Vectorized<c10::Half> C10_ALWAYS_INLINE
+  maximum(const Vectorized<c10::Half>& other) const {
+    vfloat32 a0l, a0h, a1l, a1h, b0l, b0h, b1l, b1h;
+    fp16_to_fp32(_vec0, a0l, a0h);
+    fp16_to_fp32(_vec1, a1l, a1h);
+    fp16_to_fp32(other._vec0, b0l, b0h);
+    fp16_to_fp32(other._vec1, b1l, b1h);
+    return {
+        fp32_to_fp16(vec_max_nan2(a0l, b0l), vec_max_nan2(a0h, b0h)),
+        fp32_to_fp16(vec_max_nan2(a1l, b1l), vec_max_nan2(a1h, b1h))};
+  }
+
+  Vectorized<c10::Half> C10_ALWAYS_INLINE
+  minimum(const Vectorized<c10::Half>& other) const {
+    vfloat32 a0l, a0h, a1l, a1h, b0l, b0h, b1l, b1h;
+    fp16_to_fp32(_vec0, a0l, a0h);
+    fp16_to_fp32(_vec1, a1l, a1h);
+    fp16_to_fp32(other._vec0, b0l, b0h);
+    fp16_to_fp32(other._vec1, b1l, b1h);
+    return {
+        fp32_to_fp16(vec_min_nan2(a0l, b0l), vec_min_nan2(a0h, b0h)),
+        fp32_to_fp16(vec_min_nan2(a1l, b1l), vec_min_nan2(a1h, b1h))};
+  }
 };
 
 // Free-function arithmetic ops: widen to fp32 inline, compute, narrow.
@@ -628,34 +663,19 @@ Vectorized<c10::Half>::frac() const {
   return *this - trunc();
 }
 
-// maximum/minimum: NaN-propagating. vec_max_nan2/vec_min_nan2 are templates
-// and cannot be passed as plain function pointers, so inlined directly.
+// maximum/minimum: NaN-propagating.
 template <>
 Vectorized<c10::Half> inline maximum(
     const Vectorized<c10::Half>& a,
     const Vectorized<c10::Half>& b) {
-  vfloat32 a0l, a0h, a1l, a1h, b0l, b0h, b1l, b1h;
-  Vectorized<c10::Half>::fp16_to_fp32(a.vec0(), a0l, a0h);
-  Vectorized<c10::Half>::fp16_to_fp32(a.vec1(), a1l, a1h);
-  Vectorized<c10::Half>::fp16_to_fp32(b.vec0(), b0l, b0h);
-  Vectorized<c10::Half>::fp16_to_fp32(b.vec1(), b1l, b1h);
-  return {
-      Vectorized<c10::Half>::fp32_to_fp16(vec_max_nan2(a0l, b0l), vec_max_nan2(a0h, b0h)),
-      Vectorized<c10::Half>::fp32_to_fp16(vec_max_nan2(a1l, b1l), vec_max_nan2(a1h, b1h))};
+  return a.maximum(b);
 }
 
 template <>
 Vectorized<c10::Half> inline minimum(
     const Vectorized<c10::Half>& a,
     const Vectorized<c10::Half>& b) {
-  vfloat32 a0l, a0h, a1l, a1h, b0l, b0h, b1l, b1h;
-  Vectorized<c10::Half>::fp16_to_fp32(a.vec0(), a0l, a0h);
-  Vectorized<c10::Half>::fp16_to_fp32(a.vec1(), a1l, a1h);
-  Vectorized<c10::Half>::fp16_to_fp32(b.vec0(), b0l, b0h);
-  Vectorized<c10::Half>::fp16_to_fp32(b.vec1(), b1l, b1h);
-  return {
-      Vectorized<c10::Half>::fp32_to_fp16(vec_min_nan2(a0l, b0l), vec_min_nan2(a0h, b0h)),
-      Vectorized<c10::Half>::fp32_to_fp16(vec_min_nan2(a1l, b1l), vec_min_nan2(a1h, b1h))};
+  return a.minimum(b);
 }
 
 // clamp widens once, applies both bounds in fp32, and narrows once.
@@ -716,3 +736,5 @@ Vectorized<c10::Half> C10_ALWAYS_INLINE fmadd(
 } // namespace CPU_CAPABILITY
 } // namespace vec
 } // namespace at
+
+#endif // defined(__POWER9_VECTOR__)
