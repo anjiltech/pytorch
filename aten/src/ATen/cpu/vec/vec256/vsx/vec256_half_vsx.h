@@ -352,7 +352,7 @@ class Vectorized<c10::Half> {
     __at_align__ c10::Half tmp[size()];
     store(tmp);
     for (const auto i : c10::irange(size())) {
-      if (c10::isnan(tmp[i]) || c10::isinf(tmp[i])) {
+      if (_isnan(tmp[i]) || _isinf(tmp[i])) {
         return true;
       }
     }
